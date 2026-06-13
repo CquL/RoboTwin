@@ -161,34 +161,68 @@ class SACTrainer:
     def _load_act_checkpoint(self):
         """加载 ACT checkpoint 和归一化统计量。"""
         from policy.ACT.detr.models import build_ACT_model
+        import yaml
+
+        # 尝试从 deploy_policy.yml 读取 ACT 架构参数
+        deploy_config_path = os.path.join(self.cfg.act_ckpt_dir, "..", "deploy_policy.yml")
+        deploy_config_path = os.path.normpath(deploy_config_path)
+
+        act_hidden_dim = self.cfg.act_hidden_dim
+        act_chunk_size = self.cfg.act_chunk_size
+        act_dim_feedforward = 3200
+        act_enc_layers = 4
+        act_dec_layers = 7
+        act_nheads = 8
+        act_kl_weight = 10
+        act_peft_mode = "none"
+        act_lora_r = 8
+        act_lora_alpha = 16.0
+        act_lora_dropout = 0.0
+
+        # 如果存在 peft_config.json，从那里读 LoRA 配置
+        peft_config_path = os.path.join(self.cfg.act_ckpt_dir, "peft_config.json")
+        if os.path.exists(peft_config_path):
+            import json as _json
+            try:
+                with open(peft_config_path, "r") as f:
+                    peft_cfg = _json.load(f)
+                act_peft_mode = peft_cfg.get("peft_mode", "none")
+                act_lora_r = peft_cfg.get("lora_r", 8)
+                act_lora_alpha = peft_cfg.get("lora_alpha", 16.0)
+                act_lora_dropout = peft_cfg.get("lora_dropout", 0.0)
+                print(f"[Setup] Loaded PEFT config: {peft_cfg}")
+            except Exception:
+                pass
 
         class Args:
             pass
 
         args = Args()
-        args.hidden_dim = self.cfg.act_hidden_dim
-        args.dim_feedforward = 3200
-        args.chunk_size = self.cfg.act_chunk_size
+        args.hidden_dim = act_hidden_dim
+        args.dim_feedforward = act_dim_feedforward
+        args.chunk_size = act_chunk_size
         args.camera_names = list(self.cfg.camera_names)
         args.backbone = "resnet18"
-        args.enc_layers = 4
-        args.dec_layers = 7
-        args.nheads = 8
+        args.enc_layers = act_enc_layers
+        args.dec_layers = act_dec_layers
+        args.nheads = act_nheads
         args.dropout = 0.1
         args.pre_norm = False
-        args.lr = 1e-4
-        args.lr_backbone = 1e-5
-        args.kl_weight = 10
-        args.peft_mode = "none"
-        args.lora_r = 8
-        args.lora_alpha = 16.0
-        args.lora_dropout = 0.0
-        args.state_dim = 14
         args.position_embedding = "sine"
         args.dilation = False
         args.masks = False
+        args.peft_mode = act_peft_mode
+        args.lora_r = act_lora_r
+        args.lora_alpha = act_lora_alpha
+        args.lora_dropout = act_lora_dropout
+        args.lr = 1e-4
+        args.lr_backbone = 1e-5
+        args.kl_weight = act_kl_weight
+        args.state_dim = self.cfg.state_dim
 
-        print(f"[Setup] Building ACT model (hidden_dim={args.hidden_dim}, chunk_size={args.chunk_size})...")
+        print(f"[Setup] Building ACT model: hidden_dim={args.hidden_dim}, chunk={args.chunk_size}, "
+              f"enc={args.enc_layers}, dec={args.dec_layers}, heads={args.nheads}, "
+              f"peft={args.peft_mode}")
         self.act_model = build_ACT_model(args)
         self.act_model.to(self.device)
 
@@ -359,22 +393,23 @@ class SACTrainer:
         print("=" * 60)
 
         start_time = time.time()
+        start_step = self.env_step  # 支持 resume
 
-        # 阶段 1: Warmup — ACT + noise 收集初始 replay
-        if self.cfg.warmup_steps > 0 and len(self.replay) < self.cfg.learning_starts:
+        # 阶段 1: Warmup — 仅当从头训练且 replay 不足时
+        if start_step == 0 and self.cfg.warmup_steps > 0 and len(self.replay) < self.cfg.learning_starts:
             print(f"\n[Phase 1] Warmup: collecting {self.cfg.warmup_steps} steps...")
             self._warmup_collect()
 
-        # 阶段 2: 主训练循环
-        print(f"\n[Phase 2] Main training loop ({self.cfg.total_env_steps} steps)...")
+        # 阶段 2: 主训练循环（从 start_step 开始，支持 resume）
+        print(f"\n[Phase 2] Main training loop (step {start_step} → {self.cfg.total_env_steps})...")
         obs = self.env.reset()
         episode_reward = 0.0
         episode_steps = 0
 
-        for step in range(self.cfg.total_env_steps):
+        for step in range(start_step, self.cfg.total_env_steps):
             self.env_step = step
 
-            # ---- 选择动作 ----
+            # ---- 选择动作 (warmup 已处理，这里直接 SAC) ----
             if self.env_step < self.cfg.learning_starts:
                 action = self._get_warmup_action(obs)
             else:
@@ -426,7 +461,8 @@ class SACTrainer:
         print(f"{'=' * 60}")
 
     def _warmup_collect(self):
-        """ACT + small noise 收集初始 replay 数据。"""
+        """ACT + small noise 收集初始 replay 数据。
+        完成后设置 env_step 跳过主循环中的 warmup 阶段。"""
         obs = self.env.reset()
         for _ in range(self.cfg.warmup_steps):
             action = self._get_warmup_action(obs)
@@ -439,7 +475,9 @@ class SACTrainer:
             else:
                 obs = next_obs
 
-        print(f"[Warmup] Collected {len(self.replay)} transitions")
+        # 跳过主循环中的 warmup 阶段
+        self.env_step = max(self.env_step, self.cfg.learning_starts)
+        print(f"[Warmup] Collected {len(self.replay)} transitions, env_step set to {self.env_step}")
 
     def _get_warmup_action(self, obs: Dict) -> np.ndarray:
         """
