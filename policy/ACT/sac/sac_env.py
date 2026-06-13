@@ -151,16 +151,24 @@ class SAPIENRLWrapper:
 
         self._task_env.take_action(action, action_type="qpos")
 
-        # 检测 TOPP 失败：动作与当前位置差异大但机械臂几乎没动
+        # take_action 后先获取真实观测（now_obs 只在成功时更新）
+        obs_after = self._get_obs()
+        curr_qpos = obs_after["qpos"]
+
+        # 检测 TOPP 失败：同时检查左右臂
         topp_failed = False
-        if prev_qpos is not None and self._prev_action is not None:
-            curr_qpos = self._task_env.now_obs.get("joint_action", {}).get("vector", None)
-            if curr_qpos is not None:
-                target_move = np.linalg.norm(action[:6] - prev_qpos[:6])  # 左臂目标移动量
-                actual_move = np.linalg.norm(curr_qpos[:6] - prev_qpos[:6])  # 左臂实际移动量
-                # 目标是大幅移动但实际几乎没动 → TOPP 很可能失败
-                if target_move > 0.05 and actual_move < 0.005:
-                    topp_failed = True
+        if prev_qpos is not None and curr_qpos is not None:
+            # 左臂 (indices 0-5)
+            left_target = np.linalg.norm(action[:6] - prev_qpos[:6])
+            left_actual = np.linalg.norm(curr_qpos[:6] - prev_qpos[:6])
+            # 右臂 (indices 7-12, 跳过 gripper index 6 和 13)
+            right_target = np.linalg.norm(action[7:13] - prev_qpos[7:13])
+            right_actual = np.linalg.norm(curr_qpos[7:13] - prev_qpos[7:13])
+            # 任一侧：目标大幅移动但实际几乎没动 → TOPP 失败
+            topp_failed = (
+                (left_target > 0.05 and left_actual < 0.005) or
+                (right_target > 0.05 and right_actual < 0.005)
+            )
 
         success = self._task_env.eval_success
         task_timeout = (self._task_env.step_lim is not None
@@ -169,13 +177,12 @@ class SAPIENRLWrapper:
         done = success or task_timeout or wrapper_timeout
 
         reward, reward_info = self._compute_reward(action, success, topp_failed=topp_failed)
-        obs = self._get_obs()
         self._prev_action = action.copy()
 
         info = {"success": success, "timeout": task_timeout or wrapper_timeout,
                 "step": self._step_count, "take_action_cnt": self._task_env.take_action_cnt,
                 "topp_failed": topp_failed, **reward_info}
-        return obs, reward, done, info
+        return obs_after, reward, done, info
 
     def _get_obs(self) -> Dict[str, Any]:
         raw_obs = self._task_env.get_obs()

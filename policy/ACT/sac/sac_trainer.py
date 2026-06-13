@@ -402,6 +402,7 @@ class SACTrainer:
         if start_step == 0 and self.cfg.warmup_steps > 0 and len(self.replay) < self.cfg.learning_starts:
             print(f"\n[Phase 1] Warmup: collecting {self.cfg.warmup_steps} steps...")
             self._warmup_collect()
+            start_step = self.env_step  # 更新，跳过主循环中的 warmup 阶段
 
         # 阶段 2: 主训练循环（从 start_step 开始，支持 resume）
         print(f"\n[Phase 2] Main training loop (step {start_step} → {self.cfg.total_env_steps})...")
@@ -444,8 +445,7 @@ class SACTrainer:
             # ---- 评估 ----
             if (self.env_step + 1) % self.cfg.eval_freq == 0:
                 self._evaluate()
-                # 评估后重置训练环境，避免 obs 错位
-                obs = self.env.reset()
+                # eval 使用独立 env，不需要重置训练 env
 
             # ---- 保存 checkpoint ----
             if (self.env_step + 1) % self.cfg.save_freq == 0:
@@ -700,6 +700,9 @@ class SACTrainer:
             camera_names=self.cfg.camera_names,
             device=self.device,
         )
+        # 注入 action_std，使 eval reward 尺度与训练一致
+        if self.act_stats is not None:
+            eval_env.action_std = self.act_stats["action_std"]
 
         success_count = 0
         total_reward = 0.0
