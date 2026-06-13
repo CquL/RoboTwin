@@ -52,7 +52,8 @@ class SAPIENRLWrapper:
         self._step_count = 0
         self._current_seed = seed
         self._prev_action = None
-        self._prev_dist_xy = None  # 用于 progress reward
+        self._prev_dist_xy = None
+        self.action_std = None  # 由 trainer 注入，用于 reward 中的动作平滑惩罚
 
     def _build_env(self):
         from envs import CONFIGS_PATH
@@ -143,7 +144,23 @@ class SAPIENRLWrapper:
 
     def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, Dict]:
         self._step_count += 1
+
+        # 记录执行前 qpos，用于检测 TOPP 失败
+        prev_qpos = self._task_env.now_obs.get("joint_action", {}).get("vector", None)
+        prev_qpos = prev_qpos.copy() if prev_qpos is not None else None
+
         self._task_env.take_action(action, action_type="qpos")
+
+        # 检测 TOPP 失败：动作与当前位置差异大但机械臂几乎没动
+        topp_failed = False
+        if prev_qpos is not None and self._prev_action is not None:
+            curr_qpos = self._task_env.now_obs.get("joint_action", {}).get("vector", None)
+            if curr_qpos is not None:
+                target_move = np.linalg.norm(action[:6] - prev_qpos[:6])  # 左臂目标移动量
+                actual_move = np.linalg.norm(curr_qpos[:6] - prev_qpos[:6])  # 左臂实际移动量
+                # 目标是大幅移动但实际几乎没动 → TOPP 很可能失败
+                if target_move > 0.05 and actual_move < 0.005:
+                    topp_failed = True
 
         success = self._task_env.eval_success
         task_timeout = (self._task_env.step_lim is not None
@@ -151,13 +168,13 @@ class SAPIENRLWrapper:
         wrapper_timeout = self._step_count >= self.max_episode_steps
         done = success or task_timeout or wrapper_timeout
 
-        reward, reward_info = self._compute_reward(action, success)
+        reward, reward_info = self._compute_reward(action, success, topp_failed=topp_failed)
         obs = self._get_obs()
         self._prev_action = action.copy()
 
         info = {"success": success, "timeout": task_timeout or wrapper_timeout,
                 "step": self._step_count, "take_action_cnt": self._task_env.take_action_cnt,
-                **reward_info}
+                "topp_failed": topp_failed, **reward_info}
         return obs, reward, done, info
 
     def _get_obs(self) -> Dict[str, Any]:
@@ -208,16 +225,16 @@ class SAPIENRLWrapper:
                 "right_cam": images_rgb.get("right_wrist_camera"),
                 "left_cam": images_rgb.get("left_wrist_camera")}
 
-    def _compute_reward(self, action: np.ndarray, success: bool) -> Tuple[float, Dict]:
+    def _compute_reward(self, action: np.ndarray, success: bool, topp_failed: bool = False) -> Tuple[float, Dict]:
         """
         Progress-based dense reward for beat_block_hammer.
 
         r = 10.0 * success
-          + 2.0 * (prev_dist - curr_dist)     ← progress toward block
-          + 0.5 * hammer_lifted
-          + 0.5 * hammer_near_block
-          - 0.01 * ||(a - a_prev) / action_std||²
-          - 0.001                              ← time penalty
+          + 2.0 * (prev_dist - curr_dist)
+          + 0.5 * hammer_lifted + 0.5 * hammer_near_block
+          - 1.0 * topp_failed
+          - 0.01 * action_smooth
+          - 0.001 per step
         """
         info = {"success": success}
 
@@ -254,22 +271,16 @@ class SAPIENRLWrapper:
             reward += 0.5 * float(hammer_lifted)
             reward += 0.5 * float(hammer_near_block)
 
+            # TOPP 失败惩罚
+            if topp_failed:
+                reward -= 1.0
+
             # 动作平滑惩罚（归一化空间）
-            if self._prev_action is not None:
-                from policy.ACT.sac.reward import _load_stats_once
-                import pickle as _pickle
-                stats_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "act_ckpt/act-beat_block_hammer/demo_clean_regen_20260604_144403-50/dataset_stats.pkl"
-                )
-                try:
-                    with open(stats_path, "rb") as f:
-                        _s = _pickle.load(f)
-                    action_std = _s["action_std"]
-                    delta_norm = (action - self._prev_action) / (action_std + 1e-6)
-                    reward -= 0.01 * np.sum(delta_norm ** 2)
-                except Exception:
-                    reward -= 0.01 * np.sum((action - self._prev_action) ** 2)
+            if self._prev_action is not None and self.action_std is not None:
+                delta_norm = (action - self._prev_action) / (self.action_std + 1e-6)
+                reward -= 0.01 * np.sum(delta_norm ** 2)
+            elif self._prev_action is not None:
+                reward -= 0.01 * np.sum((action - self._prev_action) ** 2)
 
             reward -= 0.001  # 时间惩罚
 

@@ -372,6 +372,9 @@ class SACTrainer:
             image_size=(self.cfg.image_height, self.cfg.image_width),
             device=self.device,
         )
+        # 注入 action_std 用于 reward 中的动作平滑惩罚
+        if self.act_stats is not None:
+            self.env.action_std = self.act_stats["action_std"]
 
     def _build_feature_extractor(self):
         """构建 ACT 特征提取器。"""
@@ -441,6 +444,8 @@ class SACTrainer:
             # ---- 评估 ----
             if (self.env_step + 1) % self.cfg.eval_freq == 0:
                 self._evaluate()
+                # 评估后重置训练环境，避免 obs 错位
+                obs = self.env.reset()
 
             # ---- 保存 checkpoint ----
             if (self.env_step + 1) % self.cfg.save_freq == 0:
@@ -682,8 +687,19 @@ class SACTrainer:
     # ================================================================
 
     def _evaluate(self, final: bool = False):
-        """评估当前策略。对每个 eval episode 使用独立 seed。"""
+        """评估当前策略。使用独立的 eval env，不动训练 env。"""
         print(f"\n[Eval] Evaluating at step {self.env_step + 1}...")
+
+        # 创建独立的 eval 环境（不动 self.env）
+        eval_env = SAPIENRLWrapper(
+            task_name=self.cfg.task_name,
+            task_config=self.cfg.task_config,
+            seed=self.cfg.seed,
+            max_episode_steps=self.cfg.max_episode_steps,
+            headless=self.cfg.headless,
+            camera_names=self.cfg.camera_names,
+            device=self.device,
+        )
 
         success_count = 0
         total_reward = 0.0
@@ -692,7 +708,7 @@ class SACTrainer:
         eval_seed = self.cfg.eval_seed_start + self.env_step
         for ep in range(self.cfg.num_eval_episodes):
             try:
-                obs = self.env.reset(seed=eval_seed + ep)
+                obs = eval_env.reset(seed=eval_seed + ep)
                 ep_reward = 0.0
                 ep_steps = 0
 
@@ -703,7 +719,7 @@ class SACTrainer:
                         _, _, mu_action = self.actor.sample(h_t, deterministic=True)
                         action = mu_action.squeeze(0).cpu().numpy()
 
-                    obs, reward, done, info = self.env.step(action)
+                    obs, reward, done, info = eval_env.step(action)
                     ep_reward += reward
                     ep_steps += 1
 
@@ -717,11 +733,9 @@ class SACTrainer:
 
             except Exception as e:
                 print(f"[Eval] Episode {ep} failed: {e}")
-                try:
-                    self.env.close()
-                except Exception:
-                    pass
                 continue
+
+        eval_env.close()
 
         success_rate = success_count / max(self.cfg.num_eval_episodes, 1)
         avg_reward = total_reward / max(self.cfg.num_eval_episodes, 1)
