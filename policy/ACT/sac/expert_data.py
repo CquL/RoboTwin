@@ -248,7 +248,7 @@ def setup_expert_data(
         task_name, task_config = best_match
         dataset_dir = task_config["dataset_dir"]
         num_episodes = task_config["num_episodes"]
-        print(f"[ExpertData] Matched: {task_name} → {dataset_dir}")
+        print(f"[ExpertData] Matched: {task_name}")
     else:
         for task_name, task_config in SIM_TASK_CONFIGS.items():
             if "beat_block_hammer" in task_name and "demo_clean" in ckpt_basename and "demo_clean" in task_name:
@@ -260,18 +260,38 @@ def setup_expert_data(
         print("[ExpertData] WARNING: Could not find expert dataset. BC regularization disabled.")
         return None, 0
 
-    # dataset_dir 是相对路径 (相对于 policy/ACT/)
-    if dataset_dir.startswith("./"):
-        act_policy_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        dataset_dir = os.path.normpath(os.path.join(act_policy_dir, dataset_dir[2:]))
+    # dataset_dir 在 SIM_TASK_CONFIGS 中可能是 str 或 list[str]
+    # 混合数据集时是 list，单数据集时是 str
+    if isinstance(dataset_dir, list):
+        dataset_dirs = dataset_dir
+        if isinstance(num_episodes, list):
+            num_episodes_list = num_episodes
+        else:
+            num_episodes_list = [num_episodes] * len(dataset_dirs)
+    else:
+        dataset_dirs = [dataset_dir]
+        num_episodes_list = [num_episodes]
 
-    print(f"[ExpertData] Loading expert data from {dataset_dir} ({num_episodes} episodes)...")
+    # 转为绝对路径 (相对路径相对于 policy/ACT/)
+    act_policy_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    resolved_dirs = []
+    for d in dataset_dirs:
+        if d.startswith("./"):
+            d = os.path.normpath(os.path.join(act_policy_dir, d[2:]))
+        resolved_dirs.append(d)
 
-    episodes = load_expert_episodes(
-        dataset_dir=dataset_dir,
-        num_episodes=num_episodes,
-        camera_names=camera_names,
-    )
+    # 从所有数据集加载 episodes
+    all_episodes = []
+    for d, n in zip(resolved_dirs, num_episodes_list):
+        print(f"[ExpertData] Loading from {d} ({n} episodes)...")
+        eps = load_expert_episodes(
+            dataset_dir=d,
+            num_episodes=n,
+            camera_names=camera_names,
+        )
+        all_episodes.extend(eps)
+
+    episodes = all_episodes
 
     if len(episodes) == 0:
         print("[ExpertData] WARNING: No episodes loaded. BC regularization disabled.")
