@@ -1,28 +1,31 @@
 """
-SAC + BC 联合训练器。
+SAC + BC 联合训练器 — ACT-frozen + SAC-head fine-tuning。
 
-实现方案书中的完整训练循环:
-    1. 环境交互 (特征提取 + 动作采样 + 环境步进)
-    2. Replay Buffer 采样
-    3. Critic 更新 (clipped double-Q)
-    4. Actor 更新 (SAC + BC regularization on expert data)
-    5. Alpha 自动温度调参
-    6. Target Network 软更新
-    7. 日志、评估、Checkpoint
+策略名称: ACT-frozen + SAC-policy-head fine-tuning
+    - 冻结 ACT trunk (backbone + Transformer)
+    - 替换原 action_head 为 SAC 随机策略头 (μ/logσ)
+    - 新增双 Q critic、target network、replay buffer
+    - BC regularization 使用预计算专家特征
 
-Head-only MVP 模式:
-    - ACT trunk 冻结，只训练 actor/critic 头
-    - Replay 存储 ACT 特征 h (而非原始图像)
-    - BC 正则使用预计算的专家特征
-    - 训练速度快、内存省
+不是 Residual RL：
+    - 不保留 ACT action_head 作为 base action
+    - SAC actor 直接输出完整动作（warm-start 自 ACT head）
+
+当前实现: Head-only MVP
+    - ACT trunk 完全冻结
+    - Feature replay (存 h 向量)
+    - 单步执行 (取 hs[:,0,:]，receding horizon)
+    - BC 正则使用预计算专家 (h, a_raw) 对
+
+不支持 (配置写了但未实现):
+    - trainable trunk / raw image replay / end-to-end SAC
 
 关键代码路径:
     obs --> ACT trunk (frozen) --> hs --> h0 = hs[:, 0, :]
         --> actor.sample(h0) --> action, log_prob  (RL 交互)
         --> critic(h0, action) --> Q values          (Critic 评估)
 
-    expert h0 --> actor.sample(h0) --> mu_action     (BC 约束)
-              --> MSE(mu_action, expert_action)      (BC loss)
+    expert h0 --> actor.mu(h0) --MSE--> expert a_raw  (BC 约束)
 """
 
 import os

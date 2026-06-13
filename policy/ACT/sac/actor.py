@@ -197,17 +197,19 @@ class TanhGaussianActor(nn.Module):
 
         if self.linear_mode:
             # ---- Linear 模式: 直接去归一化 (与 ACT post_process 一致) ----
-            action_norm = u                                    # (B, act_dim) in z-score space
+            # 限制 u 在训练分布附近，防止输出极端关节值
+            u_clamped = u.clamp(-3.0, 3.0)
+            action_norm = u_clamped                               # (B, act_dim) in z-score space
             action = action_norm * self.action_std + self.action_mean  # (B, act_dim) in raw space
 
-            # log_prob: N(action_norm | mu, std) corrected for the affine transform
-            # log π_raw(a) = log π_norm(a_norm) - Σ log(action_std)
+            # log_prob: 使用原始 u（非 clamped）计算，保证梯度正确
             log_prob_u = dist.log_prob(u)                      # (B, act_dim)
-            log_det = torch.log(self.action_std + EPS)         # (act_dim,) — Jacobian of raw = norm*std + mean
+            log_det = torch.log(self.action_std + EPS)         # (act_dim,)
             log_prob = (log_prob_u - log_det.unsqueeze(0)).sum(dim=-1, keepdim=True)  # (B, 1)
 
-            # Mean action
-            mean_action = mu * self.action_std + self.action_mean  # (B, act_dim)
+            # Mean action (也 clamp)
+            mu_clamped = mu.clamp(-3.0, 3.0)
+            mean_action = mu_clamped * self.action_std + self.action_mean
         else:
             # ---- Tanh 模式: 标准 SAC squashed Gaussian ----
             a_tanh = torch.tanh(u)
